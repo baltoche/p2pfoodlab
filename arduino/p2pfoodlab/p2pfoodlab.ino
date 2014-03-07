@@ -23,6 +23,9 @@
 #include <Wire.h>
 #include <DHT22.h>
 #include <Narcoleptic.h>
+#include <SPI.h>
+
+#include "FRAM.h"
 
 #define DEBUG 1
 
@@ -811,4 +814,214 @@ void loop()
                         Narcoleptic.delay(sleep); 
         }
 }
+
+/*
+ * FRAM API functions
+ */
+
+// init the bus then clears the FRAM
+void initFRAM()
+{
+        pinMode(FRAM_CS, OUTPUT);
+        digitalWrite(FRAM_CS, HIGH);
+        SPI.begin();
+        SPI.setDataMode(SPI_MODE0);
+        SPI.setBitOrder(MSBFIRST);
+        SPI.setClockDivider(SPI_CLOCK_DIV2);
+        FRAMClear();
+}
+
+// clears the FRAM.
+void FRAMClear()
+{
+        short zero = 0;
+        FRAMWrite(FIRST_FRAME,   (byte *)&zero, 2);
+        FRAMWrite(NEXT_FRAME,    (byte *)&zero, 2);
+        FRAMWrite(FIFO_SIZE,     (byte *)&zero, 2);
+        FRAMWrite(FRAME_COUNTER, (byte *)&zero, 2);
+}
+
+// copy one frame into (*frame) then deletes it from the FRAM.
+// (*frame) must be big enough to hosd the data
+// returns 0 on success
+//        -1 if no frames are available
+//        -2 if the RAM is corupted
+int FRAMReadFrame(byte *frame)
+{
+        unsigned short  firstFrame;
+        unsigned short  fifoSize;
+        unsigned short  frameCounter;
+        unsigned char   crc;
+        frame_header_t  header;
+
+        FRAMRead(FRAME_COUNTER, (byte *)&frameCounter, 2);
+        FRAMRead(FIFO_SIZE,     (byte *)&fifoSize, 2);
+        if (fifoSize == 0)
+                return -1;
+        FRAMRead(FIRST_FRAME,   (byte *)&firstFrame, 2);
+        FRAMCircularRead(firstFrame, (byte *)&header, FIFO_MAX_SIZE, HEADER_SIZE);
+        FRAMCircularRead((firstFrame + HEADER_SIZE) % FIFO_MAX_SIZE, (byte *)frame, FIFO_MAX_SIZE, header.frameSize);
+        crc = crc8(0, (unsigned char*)frame, header.frameSize);
+        if (crc != header.checksum)
+                return -2;
+        fifoSize -= HEADER_SIZE + header.frameSize;
+        firstFrame = (firstFrame + HEADER_SIZE + header.frameSize) % FIFO_MAX_SIZE;
+        frameCounter--;
+        FRAMWrite(FRAME_COUNTER, (byte *)&frameCounter, 2);
+        FRAMWrite(FIRST_FRAME, (byte *)&firstFrame, 2);
+        FRAMWrite(FIFO_SIZE, (byte *)&fifoSize, 2);
+        return 0;
+}
+
+// return the header of the next available frame.
+// usefull to prepare a buffer of the right size.
+// returns all fields to 0 if no frames are available.
+frame_header_t FRAMReadframeHeader()
+{
+        unsigned short firstFrame;
+        unsigned short fifoSize;
+        frame_header_t header;
+
+        header.frameSize = 0;
+        header.checksum = 0;
+        FRAMRead(FIFO_SIZE, (byte *)&fifoSize, 2);
+        if (fifoSize == 0)
+                return header;
+        FRAMRead(FIRST_FRAME, (byte *)&firstFrame, 2);
+        FRAMCircularRead(firstFrame, (byte *)&header, FIFO_MAX_SIZE, HEADER_SIZE);
+        return header;
+}
+
+// return the ammount of frames curently stored in FRAM.
+unsigned short FRAMReadFrameCounter()
+{
+        unsigned short frameCounter;
+
+        FRAMRead(FRAME_COUNTER, (byte *)&frameCounter, 2);
+        return frameCounter;
+}
+
+// Stores a buffer (*buf) of size (count) into a new frame.
+// Returns 0 on success
+//        -1 if FRAM is full.
+int FRAMWriteFrame(byte *buf, unsigned short count)
+{
+        frame_header_t header;
+        unsigned short fifoSize;
+        unsigned short lastFrame;
+        unsigned short frameCounter;
+
+        FRAMRead(FIFO_SIZE,     (byte *)&fifoSize, 2);
+        FRAMRead(NEXT_FRAME,    (byte *)&lastFrame, 2);
+        FRAMRead(FRAME_COUNTER, (byte *)&frameCounter, 2);
+        fifoSize = fifoSize + count + HEADER_SIZE;
+        if (fifoSize > FIFO_MAX_SIZE)
+                return -1;
+        header.frameSize = count;
+        header.checksum = crc8(0, (unsigned char*)buf, count);
+        FRAMCircularWrite(lastFrame, (byte *)&header, FIFO_MAX_SIZE, HEADER_SIZE);
+        FRAMCircularWrite((lastFrame + HEADER_SIZE) % FIFO_MAX_SIZE, (byte *)buf, FIFO_MAX_SIZE, count);
+        lastFrame = (lastFrame + count + HEADER_SIZE) % FIFO_MAX_SIZE;
+        frameCounter++;
+        FRAMWrite(NEXT_FRAME, (byte *)&lastFrame, 2);
+        FRAMWrite(FIFO_SIZE, (byte *)&fifoSize, 2);
+        FRAMWrite(FRAME_COUNTER, (byte *)&frameCounter, 2);
+        return 0;
+}
+
+/*
+ * FRAM internal functions
+ */
+
+// Write buffer (*buf) of size (count) at address (addr) in FRAM
+// returns 0 on success
+//        -1 on failure (invalid address)
+int FRAMWrite(int addr, byte *buf, int count)
+{
+        noInterrupts();
+        if (addr + count > FRAM_SIZE)
+        {
+                interrupts();
+                return -1;
+        }
+        byte addrMSB = (addr >> 8) & 0xff;
+        byte addrLSB = addr & 0xff;
+        digitalWrite(FRAM_CS, LOW);
+        SPI.transfer(CMD_WREN);
+        digitalWrite(FRAM_CS, HIGH);
+        digitalWrite(FRAM_CS, LOW);
+        SPI.transfer(CMD_WRITE);
+        SPI.transfer(addrMSB);
+        SPI.transfer(addrLSB);
+        for (int i = 0;i < count;i++)
+                SPI.transfer(buf[i]);
+        digitalWrite(FRAM_CS, HIGH);
+        interrupts();
+        return 0;
+}
+
+// Write buffer (*buf) of size (count) at address (addr) in FRAM
+// returns 0 on success
+//        -1 on failure (invalid address)
+int FRAMRead(int addr, byte *buf, int count)
+{
+        noInterrupts();
+        if (addr + count > FRAM_SIZE)
+        {
+                interrupts();
+                return -1;
+        }
+        byte addrMSB = (addr >> 8) & 0xff;
+        byte addrLSB = addr & 0xff;
+        digitalWrite(FRAM_CS, LOW);
+        SPI.transfer(CMD_READ);
+        SPI.transfer(addrMSB);
+        SPI.transfer(addrLSB);
+        for (int i=0; i < count; i++)
+                buf[i] = SPI.transfer(0x00);
+        digitalWrite(FRAM_CS, HIGH);
+        interrupts();
+        return 0;
+}
+
+// Read and warps around if at the end of the FRAM
+// returns 0 on success 
+//        -1 if first read fails
+//        -2 if seccond read fails
+//        -3 if both reads fail.
+int FRAMCircularRead(unsigned short addr, byte *buf, unsigned short maxAddr, int count)
+{
+        if (addr + count > maxAddr)
+        {
+                int ret = 0;
+                int cut = maxAddr - addr;
+                if (cut > 0)
+                        ret = FRAMRead(addr, buf, cut);
+                ret += FRAMRead(0, buf + cut, count - cut) * 2;
+                return ret;
+        }
+        else
+                return FRAMRead(addr, buf, count);
+}
+
+// Write and warps around if at the end of the FRAM
+// returns 0 on success
+//        -1 if first write fails
+//        -2 if seccond write fails
+//        -3 if both writes fail.
+int FRAMCircularWrite(unsigned short addr, byte *buf, unsigned short maxAddr, int count)
+{
+        if (addr + count > maxAddr)
+        {
+                int ret = 0;
+                int cut = maxAddr - addr;
+                if (cut > 0)
+                        ret =        FRAMWrite(addr, buf, cut);
+                ret += FRAMWrite(0, buf + cut, count - cut) * 2;
+                return ret;
+        }
+        else
+                return FRAMWrite(addr, buf, count);
+}
+
 
