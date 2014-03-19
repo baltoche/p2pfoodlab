@@ -31,7 +31,7 @@ void initFRAM();
 void FRAMClear();
 
 // copy one frame into (*frame) then deletes it from the FRAM.
-// (*frame) must be big enough to hosd the data
+// (*frame) must be big enough to hold the data
 // returns 0 on success
 //        -1 if no frames are available
 //        -2 if the RAM is corupted
