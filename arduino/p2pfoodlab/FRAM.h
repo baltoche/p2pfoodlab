@@ -20,6 +20,8 @@ typedef struct frame_header_s {
   unsigned char checksum;
 } frame_header_t;
 
+unsigned short FRAMFrameCounter;
+
 /*
  * FRAM API functions
  */

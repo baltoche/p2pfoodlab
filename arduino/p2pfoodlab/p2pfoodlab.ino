@@ -61,6 +61,8 @@
 #define CMD_MEASURENOW          0x14
 #define CMD_MEASUREMENT0        0x15
 #define CMD_GETMEASUREMENT      0x16
+#define CMD_RESTORESTACK        0x17
+#define CMD_RESET               0xfe
 #define CMD_DEBUG               0xff
 
 #define DEBUG_STACK             (1 << 0)
@@ -119,6 +121,8 @@ typedef struct _longstate_t {
         unsigned char period; 
         unsigned short wakeup;
         unsigned char measure;
+        unsigned char restore_stack;
+        unsigned char reset;
         unsigned short poweroff;
         unsigned short read_index;
         unsigned long minutes;
@@ -344,6 +348,8 @@ static void receive_data(int len)
                 
         } else if (state.command == CMD_GETMEASUREMENT) { 
                 // Do nothing here
+        } else if (state.command == CMD_RESET) {
+                state.reset = 1;
         }
 }
 
@@ -438,6 +444,11 @@ static void send_data()
                 send_len = sizeof(sensor_value_t);
                 for (int k = 0; k < sizeof(sensor_value_t); k++)
                         send_buf[k] = ptr[k]; // FIXME: arbitrary handling of endianess...
+        } else if (state.command == CMD_RESTORESTACK) {
+                send_len = 2;
+                send_buf[0] = (FRAMFrameCounter & 0xff00) >> 8;
+                send_buf[1] = (FRAMFrameCounter & 0x00ff);
+                state.restore_stack = 1;
         }
         
         Wire.write(send_buf, send_len);
@@ -485,6 +496,7 @@ static int get_rht03(DHT22* sensor, short* t, short* h)
 
 static void measure_sensors()
 {  
+
         DebugPrint("  measure");
 
         if (!hastime())
@@ -581,7 +593,15 @@ static void measure_sensors()
 
  unroll_stack:
         stack_frame_unroll(old_sp);
-// TODO push to FRAM restart push to stack
+        // FIXME: possible infinite loop
+        DebugPrint("  PUSHING STACK TO FRAM");
+        if (FRAMWriteFrame((byte *)&_stack, sizeof(stack_t)) == 0)
+        {
+                stack_clear();
+                measure_sensors();
+        } else {
+        DebugPrint("  FRAM FULL");
+        }
         return;
 }
 
@@ -735,6 +755,8 @@ void setup()
         state.minutes = getminutes();
         state.suspend_start = 0;
         state.command =  0xff;
+        state.restore_stack = 0;
+        state.reset = 0;
 
         new_state.suspend = 0;
         new_state.sensors =  SENSOR_TRH | SENSOR_TRHX | SENSOR_LUM | SENSOR_USBBAT;
@@ -786,6 +808,18 @@ void loop()
                 /*                 send_buf[3] = ptr[state.read_index++];  */
                 /*         } */
                 /* } */
+        }
+
+        if (state.reset)
+        {
+                asm volatile ("jmp 0");
+        }
+
+        if (state.restore_stack) {
+                DebugPrint("  RESTORING STACK FROM FRAM");
+                state.restore_stack = 0;
+                // TODO: verify that the frame is not too long.
+                FRAMReadFrame((byte *)&_stack);
         }
 
         if (state.debug & DEBUG_STATE) {
@@ -887,6 +921,7 @@ void initFRAM()
         SPI.setDataMode(SPI_MODE0);
         SPI.setBitOrder(MSBFIRST);
         SPI.setClockDivider(SPI_CLOCK_DIV2);
+        // TODO: clear only if corrupted, else restore FRAM_frame_counter in ram.
         FRAMClear();
 }
 
@@ -898,6 +933,7 @@ void FRAMClear()
         FRAMWrite(NEXT_FRAME,    (byte *)&zero, 2);
         FRAMWrite(FIFO_SIZE,     (byte *)&zero, 2);
         FRAMWrite(FRAME_COUNTER, (byte *)&zero, 2);
+        FRAMFrameCounter = 0;
 }
 
 // copy one frame into (*frame) then deletes it from the FRAM.
@@ -929,6 +965,7 @@ int FRAMReadFrame(byte *frame)
         FRAMWrite(FRAME_COUNTER, (byte *)&frameCounter, 2);
         FRAMWrite(FIRST_FRAME, (byte *)&firstFrame, 2);
         FRAMWrite(FIFO_SIZE, (byte *)&fifoSize, 2);
+        FRAMFrameCounter = frameCounter;
         return 0;
 }
 
@@ -985,6 +1022,7 @@ int FRAMWriteFrame(byte *buf, unsigned short count)
         FRAMWrite(NEXT_FRAME, (byte *)&lastFrame, 2);
         FRAMWrite(FIFO_SIZE, (byte *)&fifoSize, 2);
         FRAMWrite(FRAME_COUNTER, (byte *)&frameCounter, 2);
+        FRAMFrameCounter = frameCounter;
         return 0;
 }
 
