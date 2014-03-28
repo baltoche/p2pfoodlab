@@ -27,16 +27,28 @@ extern "C" {
 #endif
 
 #include "json.h"
+#include "sensorbox.h"
 
         json_object_t config_load(const char* file);
 
         int config_get_sensors(json_object_t config,
+                               sensor_t* sensors, int len,
                                unsigned char* enabled, 
                                unsigned char* period);
 
         const char* config_get_network_interface(json_object_t config);
 
         int config_powersaving_enabled(json_object_t config);
+
+        int config_camera_enabled(json_object_t config);
+ 
+        const char* config_get_sensorbox_name(json_object_t config);
+        double config_get_timezone(json_object_t config);
+        double config_get_latitude(json_object_t config);
+        double config_get_longitude(json_object_t config);
+
+        const char* config_getstr(json_object_t config, const char* expr);
+        double config_getnum(json_object_t config, const char* expr);
 
 #ifdef __cplusplus
 }

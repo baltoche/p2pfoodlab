@@ -30,6 +30,7 @@
 #define DEBUG 1
 
 #define SLAVE_ADDRESS           0x04
+#define V_REF                   3.3f
 
 #define DS1374_REG_TOD0		0x00 /* Time of Day */
 #define DS1374_REG_TOD1		0x01
@@ -57,6 +58,9 @@
 #define CMD_START               0x11
 #define CMD_CHECKSUM            0x12
 #define CMD_OFFSET              0x13
+#define CMD_MEASURENOW          0x14
+#define CMD_MEASUREMENT0        0x15
+#define CMD_GETMEASUREMENT      0x16
 #define CMD_DEBUG               0xff
 
 #define DEBUG_STACK             (1 << 0)
@@ -68,16 +72,16 @@
 
 #define RHT03_1_PIN             4
 #define RHT03_2_PIN             2
-#define SHT15_1_DATA_PIN        4
-#define SHT15_1_CLOCK_PIN       3
 #define LUMINOSITY_PIN          A2
 #define RPi_PIN                 9
+#define BAT_USB_PIN             A3
 #define PUMP_PIN                8
 
 #define SENSOR_TRH              (1 << 0)
 #define SENSOR_TRHX             (1 << 1)
 #define SENSOR_LUM              (1 << 2)
-#define SENSOR_SOIL             (1 << 3)
+#define SENSOR_USBBAT           (1 << 3)
+#define SENSOR_SOIL             (1 << 4)
 
 #define DEFAULT_SLEEP           20000
 
@@ -89,24 +93,28 @@
 #define DebugPrintValue(_s,_w)
 #endif
 
+typedef short sensor_value_t; 
+
 /* The update period and poweroff/wakeup times are measured in
    minutes. */
 
 typedef struct _shortstate_t {
+        int sensors: 8;
         int suspend: 1;
-        int sensors: 4;
         int linux_running: 1;
         int debug: 2;
         int reset_stack: 1;
+        int measure_now: 1;
         unsigned char period; 
         unsigned short wakeup;
+        unsigned char measurement_index; 
 } shortstate_t;
 
 typedef struct _longstate_t {
+        int sensors: 8;
         int suspend: 1;
-        int sensors: 4;
         int linux_running: 1;
-        int debug: 1;
+        int debug: 2;
         int reset_stack: 1;
         unsigned char period; 
         unsigned short wakeup;
@@ -116,6 +124,7 @@ typedef struct _longstate_t {
         unsigned long minutes;
         unsigned long suspend_start;
         unsigned char command;
+        sensor_value_t measurements[10];
 } longstate_t;
 
 longstate_t state;
@@ -180,23 +189,23 @@ static unsigned long time(unsigned long t)
 
 /* The timestamps and sensor data are pushed onto the stack until the
    RPi downloads it. */
-#define STACK_SIZE 128
-
-typedef short stack_value_t; 
+#define STACK_SIZE 168
 
 typedef struct _stack_t {
+        unsigned long offset;
         unsigned short sp;
         unsigned short frames;
         unsigned char framesize;
         unsigned char checksum;
-        unsigned long offset;
-        stack_value_t values[STACK_SIZE];
+        unsigned char disabled;
+        sensor_value_t values[STACK_SIZE];
 } stack_t;
 
 stack_t _stack;
 
 static void stack_clear()
 {
+        _stack.disabled = 0;
         _stack.sp = 0;
         _stack.frames = 0;
         _stack.checksum = 0;
@@ -207,12 +216,14 @@ static void stack_clear()
 #define stack_frame_begin()               (_stack.sp)
 #define stack_frame_unroll(__sp)          { _stack.sp = __sp; }
 #define stack_address()                   ((unsigned char*) &_stack.values[0])
-#define stack_bytesize()                  (_stack.frames * _stack.framesize * sizeof(stack_value_t))
-#define stack_frame_bytesize()            (_stack.framesize * sizeof(stack_value_t))
+#define stack_bytesize()                  (_stack.frames * _stack.framesize * sizeof(sensor_value_t))
+#define stack_frame_bytesize()            (_stack.framesize * sizeof(sensor_value_t))
 #define stack_geti(__n)                   (_stack.values[__n].i)
 #define stack_checksum()                  (_stack.checksum)
 #define stack_offset()                    (_stack.offset)
 #define stack_num_frames()                (_stack.frames)
+#define stack_disable()                   { _stack.disabled = 1; }
+#define stack_enable()                    { _stack.disabled = 0; }
 
 static void stack_frame_end()
 {
@@ -232,10 +243,10 @@ static void stack_frame_end()
 
 static int stack_pushdate(unsigned long t)
 {
-        if (!hastime()) {
+        if (!hastime() || _stack.disabled) {
                 return 1; // skip
         } else if (_stack.sp < STACK_SIZE) {
-                _stack.values[_stack.sp++] = (stack_value_t) ((t - _stack.offset) / 60);
+                _stack.values[_stack.sp++] = (sensor_value_t) ((t - _stack.offset) / 60);
                 return 1;
         } else {
                 DebugPrint("  STACK FULL");
@@ -245,10 +256,10 @@ static int stack_pushdate(unsigned long t)
 
 static int stack_push(short value)
 {
-        if (!hastime()) {
+        if (!hastime() || _stack.disabled) {
                 return 1; // skip
         } else if (_stack.sp < STACK_SIZE) {
-                _stack.values[_stack.sp++] = (stack_value_t) value;
+                _stack.values[_stack.sp++] = (sensor_value_t) value;
                 return 1;
         } else {
                 DebugPrint("  STACK FULL");
@@ -265,7 +276,7 @@ static void receive_data(int len)
 {
         unsigned char recv_buf[5];
         unsigned char recv_len = 0;
-        
+                
         for (int i = 0; i < len; i++) {
                 int v = Wire.read();
                 if (i < sizeof(recv_buf)) 
@@ -324,6 +335,15 @@ static void receive_data(int len)
         } else if ((state.command == CMD_DEBUG) 
                    && (recv_len == 1)) {
                 new_state.debug = recv_buf[1];
+
+        } else if (state.command == CMD_MEASURENOW) {
+                new_state.measure_now = 1;
+                
+        } else if (state.command == CMD_MEASUREMENT0) {
+                new_state.measurement_index = 0;
+                
+        } else if (state.command == CMD_GETMEASUREMENT) { 
+                // Do nothing here
         }
 }
 
@@ -390,13 +410,13 @@ static void send_data()
         } else if (state.command == CMD_READ) {
                 unsigned char* ptr = stack_address();
                 unsigned short len = stack_bytesize();
-                send_len = sizeof(stack_value_t);
+                send_len = sizeof(sensor_value_t);
                 if ((len == 0) || (state.read_index >= len)) {
-                        for (int k = 0; k < sizeof(stack_value_t); k++)
+                        for (int k = 0; k < sizeof(sensor_value_t); k++)
                                 send_buf[k] = 0;
                 } else  {
-                        for (int k = 0; k < sizeof(stack_value_t); k++)
-                                send_buf[k] = ptr[state.read_index++];
+                        for (int k = 0; k < sizeof(sensor_value_t); k++)
+                                send_buf[k] = ptr[state.read_index++]; // FIXME: arbitrary handling of endianess...
                 }
 
         } else if (state.command == CMD_PUMP) {
@@ -412,6 +432,12 @@ static void send_data()
                 send_buf[1] = (t & 0x00ff0000) >> 16;
                 send_buf[2] = (t & 0x0000ff00) >> 8;
                 send_buf[3] = (t & 0x000000ff);
+
+        } else if (state.command == CMD_GETMEASUREMENT) { 
+                unsigned char* ptr = (unsigned char*) &state.measurements[new_state.measurement_index++];
+                send_len = sizeof(sensor_value_t);
+                for (int k = 0; k < sizeof(sensor_value_t); k++)
+                        send_buf[k] = ptr[k]; // FIXME: arbitrary handling of endianess...
         }
         
         Wire.write(send_buf, send_len);
@@ -420,6 +446,15 @@ static void send_data()
 /*
  * Sensors & measurements
  */
+
+static short get_level_usb_batttery()
+{
+        int a = analogRead(BAT_USB_PIN);
+        //DebugPrintValue("  A3 ", a);
+        float v = V_REF * 2.0f * a / 1024.0f;
+        short r = (short) (100 * v);
+        return r;
+}
 
 static short get_luminosity()
 {
@@ -452,11 +487,11 @@ static void measure_sensors()
 {  
         DebugPrint("  measure");
 
-        if (!hastime()) {
+        if (!hastime())
                 DebugPrint("  *TIME NOT SET*");
-        }
 
         unsigned short old_sp = stack_frame_begin();
+        unsigned char index = 0;
         
         if (state.suspend) {
                 DebugPrint("  *SUSPENDED*");
@@ -469,6 +504,8 @@ static void measure_sensors()
         if (state.sensors & SENSOR_TRH) {
                 short t, rh; 
                 if (get_rht03(&rht03_1, &t, &rh) == 0) {
+                        state.measurements[index++] = t;
+                        state.measurements[index++] = rh;
                         if (!stack_push(t))
                                 goto unroll_stack;
                         if (!stack_push(rh))
@@ -485,6 +522,8 @@ static void measure_sensors()
         if (state.sensors & SENSOR_TRHX) {
                 short t, rh; 
                 if (get_rht03(&rht03_2, &t, &rh) == 0) {
+                        state.measurements[index++] = t;
+                        state.measurements[index++] = rh;
                         if (!stack_push(t))
                                 goto unroll_stack;
                         if (!stack_push(rh))
@@ -501,13 +540,23 @@ static void measure_sensors()
 
         if (state.sensors & SENSOR_LUM) {
                 short luminosity = get_luminosity(); 
+                state.measurements[index++] = luminosity;
                 if (!stack_push(luminosity))
                         goto unroll_stack;
                 DebugPrintValue("  lum ", luminosity);
         }
 
+        if (state.sensors & SENSOR_USBBAT) {
+                short lev = get_level_usb_batttery(); 
+                state.measurements[index++] = lev;
+                if (!stack_push(lev))
+                        goto unroll_stack;
+                DebugPrintValue("  usbbat ", lev);
+        }
+
         if (state.sensors & SENSOR_SOIL) {
                 short humidity = get_soilhumidity(); 
+                state.measurements[index++] = humidity;
                 if (!stack_push(humidity))
                         goto unroll_stack;
                 DebugPrintValue("  soil ", humidity);
@@ -549,6 +598,8 @@ static unsigned char count_sensors(unsigned char s)
         if (s & SENSOR_TRHX)
                 n += 2;
         if (s & SENSOR_LUM) 
+                n += 1;
+        if (s & SENSOR_USBBAT) 
                 n += 1;
         if (s & SENSOR_SOIL)
                 n += 1;
@@ -672,7 +723,7 @@ void setup()
         digitalWrite(PUMP_PIN, LOW);
 
         state.suspend = 0;
-        state.sensors = SENSOR_TRH;
+        state.sensors = SENSOR_TRH | SENSOR_TRHX | SENSOR_LUM | SENSOR_USBBAT;
         state.linux_running = 1;
         state.debug = 0;
         state.reset_stack = 0;
@@ -686,7 +737,7 @@ void setup()
         state.command =  0xff;
 
         new_state.suspend = 0;
-        new_state.sensors = SENSOR_TRH;
+        new_state.sensors =  SENSOR_TRH | SENSOR_TRHX | SENSOR_LUM | SENSOR_USBBAT;
         new_state.linux_running = 1;
         new_state.debug = 0;
         new_state.reset_stack = 0;
@@ -745,6 +796,13 @@ void loop()
         if (state.debug & DEBUG_STACK) {
                 print_stack();
                 state.debug &= ~DEBUG_STACK;
+        }
+
+        if (new_state.measure_now) {
+                stack_disable();
+                measure_sensors();
+                stack_enable();
+                new_state.measure_now = 0;
         }
 
         if (state.suspend) {
